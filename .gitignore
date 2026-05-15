@@ -1,3 +1,9 @@
 .DS_Store
 Thumbs.db
 *.log
+
+# v2.0.0 build artifacts from ps2exe - reproducible, don't track
+*.exe
+
+# Runtime state written by the installer
+state.json
