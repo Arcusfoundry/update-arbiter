@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.0.1 - in development
+
+Fix for the planned-upgrade reboot bypass observed on Win11 26200+. `NoAutoRebootWithLoggedOnUsers` and `SetActiveHours` cover the AU code path but not `MoUsoCoreWorker.exe` / `TrustedInstaller.exe` driving "Operating System: Service pack (Planned)" and "Operating System: Upgrade (Planned)" restarts — those use the feature-update code path and ignore the AU policy. Adds Windows Update for Business deferral policies so the feature/OS-upgrade reboots are held off; quality (security) updates still flow normally.
+
+- Add `DeferFeatureUpdates = 1` and `DeferFeatureUpdatesPeriodInDays = 365` (max) under `HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`.
+- Add explicit `DeferQualityUpdates = 0` and `DeferQualityUpdatesPeriodInDays = 0` so security CUs remain on the normal cadence.
+- Add `AlwaysAutoRebootAtScheduledTime = 0` under `...\WindowsUpdate\AU` as a belt-and-suspenders block against scheduled-time reboots.
+- Tray's `Get-ArbiterStatus` policy list synced with the installer so the PROTECTED badge requires the new deferral policies to be present.
+- Fix double-write in the self-heal log path. The `-SelfHeal` entry point passed `Write-FileLog` as the UI logger, and `Invoke-Install`'s internal `L` function then called `Write-FileLog` again, so every entry landed in `update-arbiter.log` twice. The UI logger is now a no-op in self-heal mode.
+- Fix "Cannot overwrite the item ... with itself" when the installer is re-run from `C:\ProgramData\ArcusFoundry`. The tray-deploy step now compares fully-resolved source/destination paths before `Copy-Item`.
+
 ## v2.0.0 - in development
 
 Major rework. Adds a GUI dashboard with an installer that verifies every step by reading the value back, and a non-elevated tray agent so users have an ongoing signal that protection is in place.

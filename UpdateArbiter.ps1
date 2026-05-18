@@ -12,7 +12,7 @@ param(
 # ---------- Constants ----------
 
 $ProductName    = 'Update Arbiter'
-$ProductVersion = '2.0.0'
+$ProductVersion = '2.0.1'
 $ProductBrand   = 'Arcus Foundry'
 $InstallDir     = 'C:\ProgramData\ArcusFoundry'
 $LogPath        = Join-Path $InstallDir 'update-arbiter.log'
@@ -33,14 +33,23 @@ $RebootTasks = @(
 )
 
 $ExpectedPolicies = @(
-    @{ Path = $AuPath; Name = 'NoAutoRebootWithLoggedOnUsers'; Value = 1  }
-    @{ Path = $WuPath; Name = 'SetActiveHours';                Value = 1  }
-    @{ Path = $WuPath; Name = 'ActiveHoursStart';              Value = 0  }
-    @{ Path = $WuPath; Name = 'ActiveHoursEnd';                Value = 18 }
-    @{ Path = $WuPath; Name = 'ActiveHoursMaxRange';           Value = 18 }
-    @{ Path = $UxPath; Name = 'ActiveHoursStart';              Value = 0  }
-    @{ Path = $UxPath; Name = 'ActiveHoursEnd';                Value = 18 }
-    @{ Path = $UxPath; Name = 'IsActiveHoursEnabled';          Value = 1  }
+    @{ Path = $AuPath; Name = 'NoAutoRebootWithLoggedOnUsers';   Value = 1   }
+    @{ Path = $WuPath; Name = 'SetActiveHours';                  Value = 1   }
+    @{ Path = $WuPath; Name = 'ActiveHoursStart';                Value = 0   }
+    @{ Path = $WuPath; Name = 'ActiveHoursEnd';                  Value = 18  }
+    @{ Path = $WuPath; Name = 'ActiveHoursMaxRange';             Value = 18  }
+    @{ Path = $UxPath; Name = 'ActiveHoursStart';                Value = 0   }
+    @{ Path = $UxPath; Name = 'ActiveHoursEnd';                  Value = 18  }
+    @{ Path = $UxPath; Name = 'IsActiveHoursEnabled';            Value = 1   }
+    # v2.0.1: Defer feature updates - blocks the MoUsoCoreWorker/TrustedInstaller
+    # "Service pack (Planned)" / "Upgrade (Planned)" reboots on Win11 26200+
+    # which bypass NoAutoRebootWithLoggedOnUsers. Quality (security) updates
+    # still flow normally.
+    @{ Path = $WuPath; Name = 'DeferFeatureUpdates';             Value = 1   }
+    @{ Path = $WuPath; Name = 'DeferFeatureUpdatesPeriodInDays'; Value = 365 }
+    @{ Path = $WuPath; Name = 'DeferQualityUpdates';             Value = 0   }
+    @{ Path = $WuPath; Name = 'DeferQualityUpdatesPeriodInDays'; Value = 0   }
+    @{ Path = $AuPath; Name = 'AlwaysAutoRebootAtScheduledTime'; Value = 0   }
 )
 
 # ---------- Helpers ----------
@@ -402,11 +411,15 @@ function Invoke-Install {
     $traySrc = Join-Path $sourceDir $TrayExeName
     $trayDst = Join-Path $InstallDir $TrayExeName
     if (Test-Path $traySrc) {
-        try {
-            Copy-Item -Path $traySrc -Destination $trayDst -Force -ErrorAction Stop
-            if (Test-Path $trayDst) { L 'OK' "Copied tray agent to $trayDst" }
-            else { L 'FAIL' 'Tray agent copy reported success but file is not present' }
-        } catch { L 'FAIL' "Could not copy tray agent: $($_.Exception.Message)" }
+        if ([IO.Path]::GetFullPath($traySrc) -ieq [IO.Path]::GetFullPath($trayDst)) {
+            L 'OK' "Tray agent already at install location"
+        } else {
+            try {
+                Copy-Item -Path $traySrc -Destination $trayDst -Force -ErrorAction Stop
+                if (Test-Path $trayDst) { L 'OK' "Copied tray agent to $trayDst" }
+                else { L 'FAIL' 'Tray agent copy reported success but file is not present' }
+            } catch { L 'FAIL' "Could not copy tray agent: $($_.Exception.Message)" }
+        }
     } else {
         L 'WARN' "Tray agent source not found at $traySrc (skipping autostart)"
     }
@@ -524,7 +537,9 @@ function Invoke-Uninstall {
 
 if ($SelfHeal) {
     if (-not (Test-Path $InstallDir)) { try { New-Item -Path $InstallDir -ItemType Directory -Force | Out-Null } catch {} }
-    $silentLog = { param($lvl, $msg) Write-FileLog $lvl $msg }
+    # Invoke-Install's internal L function already calls Write-FileLog for every
+    # entry, so the "UI" logger here is a no-op to avoid double-writing the log.
+    $silentLog = { param($lvl, $msg) }
     Invoke-Install -Log $silentLog | Out-Null
     return
 }
