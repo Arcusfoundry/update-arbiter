@@ -15,7 +15,7 @@ if (-not $gotIt) { return }
 # --- Constants ---
 
 $ProductName    = 'Update Arbiter'
-$ProductVersion = '2.0.0'
+$ProductVersion = '2.0.1'
 $ProductBrand   = 'Arcus Foundry'
 $InstallDir     = 'C:\ProgramData\ArcusFoundry'
 $MainExe        = Join-Path $InstallDir 'UpdateArbiter.exe'
@@ -27,14 +27,19 @@ $WuPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
 $UxPath = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
 
 $ExpectedPolicies = @(
-    @{ Path = $AuPath; Name = 'NoAutoRebootWithLoggedOnUsers'; Value = 1  }
-    @{ Path = $WuPath; Name = 'SetActiveHours';                Value = 1  }
-    @{ Path = $WuPath; Name = 'ActiveHoursStart';              Value = 0  }
-    @{ Path = $WuPath; Name = 'ActiveHoursEnd';                Value = 18 }
-    @{ Path = $WuPath; Name = 'ActiveHoursMaxRange';           Value = 18 }
-    @{ Path = $UxPath; Name = 'ActiveHoursStart';              Value = 0  }
-    @{ Path = $UxPath; Name = 'ActiveHoursEnd';                Value = 18 }
-    @{ Path = $UxPath; Name = 'IsActiveHoursEnabled';          Value = 1  }
+    @{ Path = $AuPath; Name = 'NoAutoRebootWithLoggedOnUsers';   Value = 1   }
+    @{ Path = $WuPath; Name = 'SetActiveHours';                  Value = 1   }
+    @{ Path = $WuPath; Name = 'ActiveHoursStart';                Value = 0   }
+    @{ Path = $WuPath; Name = 'ActiveHoursEnd';                  Value = 18  }
+    @{ Path = $WuPath; Name = 'ActiveHoursMaxRange';             Value = 18  }
+    @{ Path = $UxPath; Name = 'ActiveHoursStart';                Value = 0   }
+    @{ Path = $UxPath; Name = 'ActiveHoursEnd';                  Value = 18  }
+    @{ Path = $UxPath; Name = 'IsActiveHoursEnabled';            Value = 1   }
+    @{ Path = $WuPath; Name = 'DeferFeatureUpdates';             Value = 1   }
+    @{ Path = $WuPath; Name = 'DeferFeatureUpdatesPeriodInDays'; Value = 365 }
+    @{ Path = $WuPath; Name = 'DeferQualityUpdates';             Value = 0   }
+    @{ Path = $WuPath; Name = 'DeferQualityUpdatesPeriodInDays'; Value = 0   }
+    @{ Path = $AuPath; Name = 'AlwaysAutoRebootAtScheduledTime'; Value = 0   }
 )
 
 $PollIntervalMs = 5 * 60 * 1000  # 5 minutes
