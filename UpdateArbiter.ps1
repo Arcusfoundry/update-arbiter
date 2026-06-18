@@ -12,7 +12,7 @@ param(
 # ---------- Constants ----------
 
 $ProductName    = 'Update Arbiter'
-$ProductVersion = '2.0.1'
+$ProductVersion = '2.0.2'
 $ProductBrand   = 'Arcus Foundry'
 $InstallDir     = 'C:\ProgramData\ArcusFoundry'
 $LogPath        = Join-Path $InstallDir 'update-arbiter.log'
@@ -25,6 +25,13 @@ $RunKeyName     = 'UpdateArbiterTray'
 $AuPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
 $WuPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
 $UxPath = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+
+# The auto-update reboot-required signal. Presence of this KEY is how Windows
+# Update marks "an update is staged, restart wanted". Safe to delete - Windows
+# recreates it if a reboot is genuinely still pending. We deliberately do NOT
+# touch Component Based Servicing\RebootPending: clearing that mid-servicing can
+# corrupt the component store and leave updates half-applied.
+$RebootRequiredKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
 
 $RebootTasks = @(
     @{ Path = '\Microsoft\Windows\UpdateOrchestrator\'; Name = 'Reboot' }
@@ -273,9 +280,21 @@ function Get-ArbiterStatus {
 
 function Save-ArbiterState {
     if (-not (Test-Path $InstallDir)) { New-Item -Path $InstallDir -ItemType Directory -Force | Out-Null }
+    # Preserve the original install timestamp across self-heal rearms; only stamp it
+    # the first time. LastRearmAt updates on every successful apply and is what the
+    # tray shows as "Last rearm" - Task Scheduler's LastRunTime is unreliable for
+    # SYSTEM tasks and can stay pinned at the 1899 sentinel even after a run.
+    $installedAt = (Get-Date).ToString('o')
+    if (Test-Path $StateFile) {
+        try {
+            $prev = Get-Content $StateFile -Raw | ConvertFrom-Json
+            if ($prev.InstalledAt) { $installedAt = $prev.InstalledAt }
+        } catch { }
+    }
     @{
         Version     = $ProductVersion
-        InstalledAt = (Get-Date).ToString('o')
+        InstalledAt = $installedAt
+        LastRearmAt = (Get-Date).ToString('o')
         InstalledBy = "$env:USERDOMAIN\$env:USERNAME"
     } | ConvertTo-Json | Set-Content -Path $StateFile -Encoding UTF8
 }
@@ -283,7 +302,11 @@ function Save-ArbiterState {
 # ---------- Install / Uninstall ----------
 
 function Invoke-Install {
-    param([scriptblock]$Log)
+    # -Headless: the silent SYSTEM self-heal path (boot/logon/daily/event). In this
+    # mode we re-assert policies and reboot tasks but never touch the tray: SYSTEM
+    # runs in session 0 and cannot manage or relaunch a tray on the user's desktop,
+    # and HKCU resolves to SYSTEM's hive, not the logged-on user's.
+    param([scriptblock]$Log, [switch]$Headless)
 
     function L { param([string]$Level, [string]$Msg) & $Log $Level $Msg; Write-FileLog $Level $Msg }
 
@@ -356,6 +379,17 @@ function Invoke-Install {
         }
     }
 
+    L 'STEP' 'Clearing pending-reboot flag'
+    if (Test-Path $RebootRequiredKey) {
+        try {
+            Remove-Item -Path $RebootRequiredKey -Recurse -Force -ErrorAction Stop
+            if (Test-Path $RebootRequiredKey) { L 'WARN' 'RebootRequired key still present after delete' }
+            else { L 'OK' 'Removed RebootRequired flag (a reboot was being requested)' }
+        } catch { L 'WARN' "Could not clear RebootRequired flag: $($_.Exception.Message)" }
+    } else {
+        L 'OK' 'No pending-reboot flag set'
+    }
+
     L 'STEP' 'Registering self-heal scheduled task'
     try {
         if ($isExe) {
@@ -370,6 +404,15 @@ function Invoke-Install {
         $triggers = @()
         $triggers += New-ScheduledTaskTrigger -AtStartup
         $triggers += New-ScheduledTaskTrigger -AtLogOn
+        # Hourly rearm heartbeat: re-assert policies, re-disable reboot tasks, and
+        # clear the reboot-required flag every hour, so drift that fires no
+        # WindowsUpdateClient 19/43 event (e.g. a reboot task silently re-enabled,
+        # or the flag set mid-uptime) is corrected within the hour. Building the
+        # repetition through -RepetitionInterval populates the pattern correctly
+        # (a bare trigger's .Repetition is null); omitting -RepetitionDuration means
+        # repeat indefinitely. StartWhenAvailable runs a missed slot once awake.
+        $triggers += New-ScheduledTaskTrigger -Once -At (Get-Date) `
+            -RepetitionInterval (New-TimeSpan -Hours 1)
 
         $cimTrigger = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler
         $eventTrigger = New-CimInstance -CimClass $cimTrigger -ClientOnly
@@ -393,7 +436,7 @@ function Invoke-Install {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
         Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers `
             -Principal $principal -Settings $settings `
-            -Description "$ProductName self-heal v$ProductVersion - re-applies lockdown at boot, logon, and WindowsUpdateClient 19/43" `
+            -Description "$ProductName self-heal v$ProductVersion - re-applies lockdown and clears the reboot flag at boot, logon, hourly, and on WindowsUpdateClient 19/43" `
             -ErrorAction Stop | Out-Null
 
         $confirm = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
@@ -406,54 +449,68 @@ function Invoke-Install {
         L 'FAIL' "Scheduled task registration failed: $($_.Exception.Message)"
     }
 
-    L 'STEP' 'Deploying tray agent'
-    $sourceDir = Split-Path -Parent (Get-SelfExecutablePath)
-    $traySrc = Join-Path $sourceDir $TrayExeName
-    $trayDst = Join-Path $InstallDir $TrayExeName
-    if (Test-Path $traySrc) {
-        if ([IO.Path]::GetFullPath($traySrc) -ieq [IO.Path]::GetFullPath($trayDst)) {
-            L 'OK' "Tray agent already at install location"
-        } else {
-            try {
-                Copy-Item -Path $traySrc -Destination $trayDst -Force -ErrorAction Stop
-                if (Test-Path $trayDst) { L 'OK' "Copied tray agent to $trayDst" }
-                else { L 'FAIL' 'Tray agent copy reported success but file is not present' }
-            } catch { L 'FAIL' "Could not copy tray agent: $($_.Exception.Message)" }
-        }
+    if ($Headless) {
+        # SYSTEM self-heal: leave the tray entirely alone. The binary already lives
+        # in the install dir and the user's autostart key was set at interactive
+        # install time. Killing the tray here would empty the notification area
+        # until next logon, and any HKCU write would hit SYSTEM's hive.
+        L 'STEP' 'Tray agent (headless: leaving running tray and autostart untouched)'
     } else {
-        L 'WARN' "Tray agent source not found at $traySrc (skipping autostart)"
-    }
-
-    if (Test-Path $trayDst) {
-        L 'STEP' 'Registering tray autostart (HKCU Run key)'
-        try {
-            $runValue = "`"$trayDst`""
-            if (-not (Test-Path $RunKeyPath)) { New-Item -Path $RunKeyPath -Force | Out-Null }
-            Set-ItemProperty -Path $RunKeyPath -Name $RunKeyName -Value $runValue -ErrorAction Stop
-            $read = (Get-ItemProperty -Path $RunKeyPath -Name $RunKeyName -ErrorAction Stop).$RunKeyName
-            if ($read -eq $runValue) { L 'OK' "Autostart registered + verified: $RunKeyPath\$RunKeyName" }
-            else { L 'FAIL' "Set autostart but read back '$read'" }
-        } catch { L 'FAIL' "Could not register tray autostart: $($_.Exception.Message)" }
-
-        L 'STEP' 'Starting tray agent now'
-        # Stop any existing tray instance first so it picks up the new EXE
+        L 'STEP' 'Deploying tray agent'
+        $sourceDir = Split-Path -Parent (Get-SelfExecutablePath)
+        $traySrc = Join-Path $sourceDir $TrayExeName
+        $trayDst = Join-Path $InstallDir $TrayExeName
         $trayProcName = [IO.Path]::GetFileNameWithoutExtension($TrayExeName)
+
+        # Stop any running tray BEFORE copying. A running tray holds an exclusive
+        # lock on its EXE, so copying first would fail with "file in use" and leave
+        # the stale binary in place (the old order did exactly that).
+        $stoppedTray = $false
         Get-Process -Name $trayProcName -ErrorAction SilentlyContinue | ForEach-Object {
-            try { $_.Kill(); $_.WaitForExit(2000) } catch { }
+            try { $_.Kill(); $_.WaitForExit(2000); $stoppedTray = $true } catch { }
         }
-        try {
-            # Launch as the interactive user, NOT elevated. Since this installer
-            # is elevated, Start-Process inherits elevation; use the shell to
-            # spawn at the caller's medium-integrity level.
-            $shell = New-Object -ComObject Shell.Application
-            $shell.ShellExecute($trayDst, '', $InstallDir, $null, 1)
-            Start-Sleep -Milliseconds 600
-            if (Get-Process -Name $trayProcName -ErrorAction SilentlyContinue) {
-                L 'OK' 'Tray agent running'
+        if ($stoppedTray) { L 'OK' 'Stopped running tray agent so its EXE can be replaced' }
+
+        if (Test-Path $traySrc) {
+            if ([IO.Path]::GetFullPath($traySrc) -ieq [IO.Path]::GetFullPath($trayDst)) {
+                L 'OK' "Tray agent already at install location"
             } else {
-                L 'WARN' 'Tray agent did not appear after launch (will start on next logon)'
+                try {
+                    Copy-Item -Path $traySrc -Destination $trayDst -Force -ErrorAction Stop
+                    if (Test-Path $trayDst) { L 'OK' "Copied tray agent to $trayDst" }
+                    else { L 'FAIL' 'Tray agent copy reported success but file is not present' }
+                } catch { L 'FAIL' "Could not copy tray agent: $($_.Exception.Message)" }
             }
-        } catch { L 'WARN' "Could not auto-start tray: $($_.Exception.Message) (will start on next logon)" }
+        } else {
+            L 'WARN' "Tray agent source not found at $traySrc (skipping autostart)"
+        }
+
+        if (Test-Path $trayDst) {
+            L 'STEP' 'Registering tray autostart (HKCU Run key)'
+            try {
+                $runValue = "`"$trayDst`""
+                if (-not (Test-Path $RunKeyPath)) { New-Item -Path $RunKeyPath -Force | Out-Null }
+                Set-ItemProperty -Path $RunKeyPath -Name $RunKeyName -Value $runValue -ErrorAction Stop
+                $read = (Get-ItemProperty -Path $RunKeyPath -Name $RunKeyName -ErrorAction Stop).$RunKeyName
+                if ($read -eq $runValue) { L 'OK' "Autostart registered + verified: $RunKeyPath\$RunKeyName" }
+                else { L 'FAIL' "Set autostart but read back '$read'" }
+            } catch { L 'FAIL' "Could not register tray autostart: $($_.Exception.Message)" }
+
+            L 'STEP' 'Starting tray agent now'
+            try {
+                # Launch as the interactive user, NOT elevated. Since this installer
+                # is elevated, Start-Process inherits elevation; use the shell to
+                # spawn at the caller's medium-integrity level.
+                $shell = New-Object -ComObject Shell.Application
+                $shell.ShellExecute($trayDst, '', $InstallDir, $null, 1)
+                Start-Sleep -Milliseconds 600
+                if (Get-Process -Name $trayProcName -ErrorAction SilentlyContinue) {
+                    L 'OK' 'Tray agent running'
+                } else {
+                    L 'WARN' 'Tray agent did not appear after launch (will start on next logon)'
+                }
+            } catch { L 'WARN' "Could not auto-start tray: $($_.Exception.Message) (will start on next logon)" }
+        }
     }
 
     L 'STEP' 'Refreshing Group Policy'
@@ -540,7 +597,7 @@ if ($SelfHeal) {
     # Invoke-Install's internal L function already calls Write-FileLog for every
     # entry, so the "UI" logger here is a no-op to avoid double-writing the log.
     $silentLog = { param($lvl, $msg) }
-    Invoke-Install -Log $silentLog | Out-Null
+    Invoke-Install -Log $silentLog -Headless | Out-Null
     return
 }
 
