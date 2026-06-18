@@ -6,21 +6,42 @@
 #Requires -Version 5.1
 
 # --- Single instance guard ---
-
-$mutex = New-Object System.Threading.Mutex($false, 'Global\UpdateArbiterTray.SingleInstance')
-$gotIt = $false
-try { $gotIt = $mutex.WaitOne(0, $false) } catch { $gotIt = $false }
-if (-not $gotIt) { return }
+# Session-scoped (Local\), not machine-wide (Global\). One tray per logon
+# session is correct; it also avoids the SeCreateGlobalPrivilege requirement
+# and the cross-session DACL clash that made the Global\ object throw
+# UnauthorizedAccessException ("Access to the path ... is denied") on boot.
+# Guard fails open: if the mutex can't be created/acquired for any reason,
+# launch anyway rather than crashing with an error box.
+$mutex = $null
+try {
+    $mutex = New-Object System.Threading.Mutex($false, 'Local\UpdateArbiterTray.SingleInstance')
+    if (-not $mutex.WaitOne(0, $false)) { return }  # another instance already owns it
+} catch [System.Threading.AbandonedMutexException] {
+    # Previous owner died without releasing; we now own it. Continue.
+} catch {
+    $mutex = $null  # guard unavailable; proceed without single-instance protection
+}
 
 # --- Constants ---
 
 $ProductName    = 'Update Arbiter'
-$ProductVersion = '2.0.1'
+$ProductVersion = '2.0.2'
 $ProductBrand   = 'Arcus Foundry'
 $InstallDir     = 'C:\ProgramData\ArcusFoundry'
 $MainExe        = Join-Path $InstallDir 'UpdateArbiter.exe'
 $LogPath        = Join-Path $InstallDir 'update-arbiter.log'
 $TaskName       = 'Arcus Foundry Update Arbiter'
+$ProductPage    = 'https://arcusfoundry.com/labs/update-arbiter'
+
+# Version manifest the tray polls hourly to tell existing users a newer Update
+# Arbiter (with better reboot-circumvention) is out. Expected JSON shape:
+#   { "version": "2.0.2", "url": "https://.../UpdateArbiter.exe", "notes": "..." }
+# A missing/unreachable endpoint is a silent no-op (the check never blocks).
+$VersionUrl     = 'https://arcusfoundry.com/labs/update-arbiter/version.json'
+
+# Auto-update reboot-required flag. The tray cannot delete it (non-elevated), so
+# when it sees the flag it triggers the SYSTEM self-heal task, which clears it.
+$RebootRequiredKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
 
 $AuPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
 $WuPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
@@ -61,10 +82,16 @@ function Get-ArbiterStatus {
 
     $taskState = 'NotRegistered'
     $taskHealthy = $false
+    $taskLastRun = $null
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($task) {
         $taskState = "$($task.State)"
         $taskHealthy = ($task.State -ne 'Disabled')
+        try {
+            $lr = ($task | Get-ScheduledTaskInfo).LastRunTime
+            # Task Scheduler reports 1899-12-30 when a task has never run.
+            if ($lr -and $lr.Year -gt 1900) { $taskLastRun = $lr }
+        } catch { }
     }
 
     $installedVersion = $null
@@ -74,18 +101,54 @@ function Get-ArbiterStatus {
         try {
             $state = Get-Content $stateFile -Raw | ConvertFrom-Json
             $installedVersion = $state.Version
-            $installedAt = [DateTime]$state.InstalledAt
+            if ($state.InstalledAt) { $installedAt = [DateTime]$state.InstalledAt }
+            # Prefer the rearm stamp written by every successful self-heal; the
+            # scheduler's LastRunTime is unreliable for SYSTEM tasks. Falls back to
+            # the task LastRunTime captured above when the stamp isn't present yet.
+            if ($state.LastRearmAt) { $taskLastRun = [DateTime]$state.LastRearmAt }
         } catch { }
     }
 
+    $rebootFlag = Test-Path $RebootRequiredKey
+
     [PSCustomObject]@{
-        Protected        = ($allOk -and $taskHealthy)
-        AllPoliciesOk    = $allOk
-        TaskState        = $taskState
-        TaskHealthy      = $taskHealthy
-        InstalledVersion = $installedVersion
-        InstalledAt      = $installedAt
-        MissingPolicies  = $missing
+        Protected         = ($allOk -and $taskHealthy)
+        AllPoliciesOk     = $allOk
+        TaskState         = $taskState
+        TaskHealthy       = $taskHealthy
+        TaskLastRun       = $taskLastRun
+        InstalledVersion  = $installedVersion
+        InstalledAt       = $installedAt
+        MissingPolicies   = $missing
+        RebootFlagPresent = $rebootFlag
+    }
+}
+
+# --- Update check: is a newer Update Arbiter published? ---
+# Existing users have no way to know a new version (with better circumvention)
+# shipped. Polled hourly. Returns the manifest object if a strictly newer version
+# is available, else $null. Any failure (no endpoint, offline, bad JSON) is a
+# silent no-op - this must never interrupt the tray.
+function Get-AvailableUpdate {
+    try {
+        $m = Invoke-RestMethod -Uri $VersionUrl -TimeoutSec 5 -ErrorAction Stop
+        if (-not $m.version) { return $null }
+        if ([version]$m.version -gt [version]$ProductVersion) { return $m }
+    } catch { }
+    return $null
+}
+
+# --- Rearm: trigger the SYSTEM self-heal task to re-apply the lockdown ---
+# The tray runs non-elevated and cannot write HKLM policies or touch protected
+# Update Orchestrator tasks directly. The SYSTEM self-heal task can. The default
+# task security descriptor grants Authenticated Users execute rights, so starting
+# it from a medium-integrity process needs no UAC prompt.
+function Invoke-Rearm {
+    try {
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
     }
 }
 
@@ -159,6 +222,22 @@ $miStatus = [System.Windows.Forms.ToolStripMenuItem]::new('Status: checking...')
 $miStatus.Enabled = $false
 [void]$menu.Items.Add($miStatus)
 
+$miLastRun = [System.Windows.Forms.ToolStripMenuItem]::new('Last rearm: unknown')
+$miLastRun.Enabled = $false
+[void]$menu.Items.Add($miLastRun)
+
+# Hidden until a newer version is published. Click opens the download page.
+$miUpdate = [System.Windows.Forms.ToolStripMenuItem]::new('Update available')
+$miUpdate.Visible = $false
+$miUpdate.ForeColor = [System.Drawing.Color]::FromArgb(40, 110, 40)
+$miUpdate.Font = [System.Drawing.Font]::new($menu.Font, [System.Drawing.FontStyle]::Bold)
+$miUpdate.Add_Click({
+    $target = if ($script:UpdateUrl) { $script:UpdateUrl } else { $ProductPage }
+    try { Start-Process $target -ErrorAction Stop }
+    catch { [System.Windows.Forms.MessageBox]::Show("Could not open $target", $ProductName) | Out-Null }
+})
+[void]$menu.Items.Add($miUpdate)
+
 [void]$menu.Items.Add([System.Windows.Forms.ToolStripSeparator]::new())
 
 $miOpen = [System.Windows.Forms.ToolStripMenuItem]::new('Open Dashboard...')
@@ -175,6 +254,22 @@ $miOpen.Add_Click({
 
 $miVerify = [System.Windows.Forms.ToolStripMenuItem]::new('Verify Now')
 [void]$menu.Items.Add($miVerify)
+
+$miRearm = [System.Windows.Forms.ToolStripMenuItem]::new('Rearm Now')
+$miRearm.Add_Click({
+    if (Invoke-Rearm) {
+        $script:LastRearmAttempt = Get-Date
+        $notify.ShowBalloonTip(2500, $ProductName, 'Rearm triggered. Re-applying lockdown...',
+            [System.Windows.Forms.ToolTipIcon]::Info)
+        $recheckTimer.Start()
+    } else {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Could not trigger rearm.`n`nThe self-heal task '$TaskName' may not be registered. Open the dashboard and run Install / Repair.",
+            $ProductName, [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+    }
+})
+[void]$menu.Items.Add($miRearm)
 
 $miLog = [System.Windows.Forms.ToolStripMenuItem]::new('View Log')
 $miLog.Add_Click({
@@ -193,7 +288,7 @@ $miLog.Add_Click({
 $miAbout = [System.Windows.Forms.ToolStripMenuItem]::new('About')
 $miAbout.Add_Click({
     [System.Windows.Forms.MessageBox]::Show(
-        "$ProductName v$ProductVersion`n$ProductBrand`n`nStops Windows from rebooting without your consent.`nhttps://arcusfoundry.com/update-arbiter",
+        "$ProductName v$ProductVersion`n$ProductBrand`n`nStops Windows from rebooting without your consent.`nhttps://arcusfoundry.com/labs/update-arbiter",
         $ProductName,
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
@@ -208,6 +303,9 @@ $notify.ContextMenuStrip = $menu
 # --- State update ---
 
 $script:LastCheck = $null
+$script:LastRearmAttempt = $null
+$script:LastVersionCheck = $null
+$script:UpdateUrl = $null
 
 function Set-Tooltip {
     param([string]$Text)
@@ -228,6 +326,9 @@ function Update-State {
     $script:LastCheck = Get-Date
     $hhmm = $script:LastCheck.ToString('HH:mm')
 
+    if ($s.TaskLastRun) { $miLastRun.Text = "Last rearm: $($s.TaskLastRun.ToString('yyyy-MM-dd HH:mm'))" }
+    else { $miLastRun.Text = 'Last rearm: never recorded' }
+
     if ($s.Protected) {
         $notify.Icon = $iconProtected
         # Tooltip: short signal only (63-char cap). Detail goes in the menu.
@@ -244,6 +345,60 @@ function Update-State {
         $reasonStr = $reasons -join '; '
         $miStatus.Text = "Status: NOT PROTECTED ($reasonStr)"
         $miStatus.ForeColor = [System.Drawing.Color]::FromArgb(170, 30, 30)
+
+        # Auto-rearm on drift: trigger the SYSTEM self-heal task to re-apply the
+        # lockdown before a reboot can fire. Cooldown stops the tray hammering the
+        # task every poll when the drift is something a rearm can't fix (e.g. a
+        # policy write genuinely failing), while still re-trying periodically.
+        $cooldownOk = (-not $script:LastRearmAttempt) -or `
+                      (($script:LastCheck - $script:LastRearmAttempt).TotalMinutes -ge 30)
+        if ($cooldownOk) {
+            $script:LastRearmAttempt = $script:LastCheck
+            if (Invoke-Rearm) {
+                $notify.ShowBalloonTip(3000, $ProductName,
+                    'Protection drifted - rearm triggered to block reboots.',
+                    [System.Windows.Forms.ToolTipIcon]::Warning)
+                $recheckTimer.Start()
+            }
+        }
+    }
+
+    # Reboot flag is the most urgent signal: an update is staged and Windows wants
+    # to restart. The tray can't delete the HKLM key, so trigger the SYSTEM
+    # self-heal (which clears it). Shares the rearm cooldown so we don't stack
+    # triggers when drift already kicked one off this cycle.
+    if ($s.RebootFlagPresent) {
+        $notify.Icon = $iconUnknown
+        Set-Tooltip "$ProductName - REBOOT PENDING, clearing ($hhmm)"
+        $cooldownOk = (-not $script:LastRearmAttempt) -or `
+                      (($script:LastCheck - $script:LastRearmAttempt).TotalMinutes -ge 30)
+        if ($cooldownOk) {
+            $script:LastRearmAttempt = $script:LastCheck
+            if (Invoke-Rearm) {
+                $notify.ShowBalloonTip(4000, $ProductName,
+                    'Windows set a reboot flag. Rearm triggered to clear it and block the restart.',
+                    [System.Windows.Forms.ToolTipIcon]::Warning)
+                $recheckTimer.Start()
+            }
+        }
+    }
+
+    # Hourly check for a newer Update Arbiter (better circumvention). Silent if the
+    # endpoint is absent/unreachable. Notifies once when an update first appears.
+    if ((-not $script:LastVersionCheck) -or (($script:LastCheck - $script:LastVersionCheck).TotalMinutes -ge 60)) {
+        $script:LastVersionCheck = $script:LastCheck
+        $upd = Get-AvailableUpdate
+        if ($upd) {
+            $script:UpdateUrl = if ($upd.url) { $upd.url } else { $ProductPage }
+            $miUpdate.Text = "Update available: v$($upd.version) - click to get it"
+            if (-not $miUpdate.Visible) {
+                $miUpdate.Visible = $true
+                $note = if ($upd.notes) { "`n$($upd.notes)" } else { '' }
+                $notify.ShowBalloonTip(6000, "$ProductName update available",
+                    "Version $($upd.version) is out (you have $ProductVersion).$note",
+                    [System.Windows.Forms.ToolTipIcon]::Info)
+            }
+        }
     }
 }
 
@@ -260,6 +415,12 @@ $timer.Interval = $PollIntervalMs
 $timer.Add_Tick({ Update-State })
 $timer.Start()
 
+# One-shot timer to re-check status a few seconds after a rearm is triggered,
+# giving the SYSTEM self-heal task time to re-apply the lockdown before we repaint.
+$recheckTimer = [System.Windows.Forms.Timer]::new()
+$recheckTimer.Interval = 15000
+$recheckTimer.Add_Tick({ $recheckTimer.Stop(); Update-State })
+
 # --- Click to open dashboard ---
 
 $notify.Add_DoubleClick({ $miOpen.PerformClick() })
@@ -271,6 +432,7 @@ $doExit = {
     if ($script:exiting) { return }
     $script:exiting = $true
     $timer.Stop(); $timer.Dispose()
+    $recheckTimer.Stop(); $recheckTimer.Dispose()
     $notify.Visible = $false
     $notify.Dispose()
     try { $mutex.ReleaseMutex() } catch { }

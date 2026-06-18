@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.0.2 - 2026-06-18
+
+Reliability and self-defense pass on the v2.0.x agent, plus a self-update signal.
+
+- Fix tray crash on boot. The single-instance guard moved from the machine-wide `Global\` namespace to session-scoped `Local\`, ending the `Access to the path 'Global\UpdateArbiterTray.SingleInstance' is denied` exception (a `Global\` named object needs `SeCreateGlobalPrivilege` and matching DACL rights the non-elevated tray may lack). The guard now fails open and handles `AbandonedMutexException`.
+- Self-heal hardening. `Invoke-Install` takes a new `-Headless` switch for the SYSTEM self-heal path, which no longer kills/relaunches the user's tray or writes the `HKCU` autostart key. SYSTEM runs in session 0, so doing either would empty the notification area until next logon.
+- Fix tray-deploy ordering. The interactive installer now stops a running tray before copying its EXE, so a repair no longer fails on the file lock and relaunches a stale binary.
+- Hourly rearm. The self-heal task now also fires hourly (a `TimeTrigger` with a 1-hour repetition) on top of boot, logon, and `WindowsUpdateClient` 19/43.
+- Reboot-flag kill. Every self-heal deletes `...\WindowsUpdate\Auto Update\RebootRequired` when present. Component Based Servicing `RebootPending` is deliberately left untouched (clearing it mid-servicing can corrupt the component store). The tray also detects the flag each poll and triggers a SYSTEM rearm to clear it.
+- Reliable "Last rearm". Sourced from a `LastRearmAt` stamp written to `state.json` on every successful self-heal, since Task Scheduler's `LastRunTime` is unreliable for SYSTEM tasks and can stay pinned at the 1899 sentinel. `InstalledAt` is preserved across rearms.
+- New-version notifier. The tray polls a `version.json` manifest hourly and surfaces a download prompt when a newer Update Arbiter is published. Silent no-op when the endpoint is absent or unreachable.
+- Product URLs updated to `arcusfoundry.com/labs/update-arbiter`.
+
 ## v2.0.1 - in development
 
 Fix for the planned-upgrade reboot bypass observed on Win11 26200+. `NoAutoRebootWithLoggedOnUsers` and `SetActiveHours` cover the AU code path but not `MoUsoCoreWorker.exe` / `TrustedInstaller.exe` driving "Operating System: Service pack (Planned)" and "Operating System: Upgrade (Planned)" restarts — those use the feature-update code path and ignore the AU policy. Adds Windows Update for Business deferral policies so the feature/OS-upgrade reboots are held off; quality (security) updates still flow normally.

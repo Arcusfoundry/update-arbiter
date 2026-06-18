@@ -17,7 +17,7 @@
     silently undo the lockdown.
 
     Free tool from Arcus Foundry. Use at your own risk.
-    https://arcusfoundry.com/update-arbiter
+    https://arcusfoundry.com/labs/update-arbiter
 
 .PARAMETER Install
     Installs this script to C:\ProgramData\ArcusFoundry\ and registers the
@@ -91,7 +91,7 @@ function Write-Banner {
         '  |                                                        |',
         '  +--------------------------------------------------------+',
         '  |  Free tool. No warranty. Use at your own risk.         |',
-        '  |  https://arcusfoundry.com/update-arbiter               |',
+        '  |  https://arcusfoundry.com/labs/update-arbiter               |',
         '  +--------------------------------------------------------+',
         ''
     )
@@ -110,7 +110,7 @@ if ($Uninstall) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
     if (Test-Path $installedScriptPath) { Remove-Item $installedScriptPath -Force }
     Write-Log "Uninstall complete. Registry policies and disabled reboot tasks remain in place." 'Green'
-    Write-Log "To fully revert, see https://arcusfoundry.com/update-arbiter#uninstall" 'DarkGray'
+    Write-Log "To fully revert, see https://arcusfoundry.com/labs/update-arbiter#uninstall" 'DarkGray'
     return
 }
 
